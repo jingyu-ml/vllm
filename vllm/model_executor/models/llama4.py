@@ -363,11 +363,23 @@ class Llama4Model(LlamaModel):
                 continue
             param = params_dict[full_param_name]
             weight_loader = param.weight_loader
+
+            # Helper function to check if the weight is FP4.
+            # We use uint8 to store FP4 weights for now.
+            def is_fp4_weight(weight):
+                return weight.dtype == torch.uint8
+
             if fused:
                 if "w13" in full_param_name:
                     shard_idx = 0 if shard_id == "w1" else 1
                     new_loaded_weight = new_loaded_weight[shard_idx]
-                new_loaded_weight = new_loaded_weight.transpose(-1, -2)
+
+                # Only transpose for non-FP4 weights
+                # FP4 weights are already in the correct format and
+                # shouldn't be transposed here.
+                if not is_fp4_weight(new_loaded_weight):
+                    new_loaded_weight = new_loaded_weight.transpose(-1, -2)
+
                 layer_idx = extract_layer_index(name)
                 # EP mapping
                 expert_map = self.layers[
@@ -382,6 +394,11 @@ class Llama4Model(LlamaModel):
             else:
                 # TODO: add EP support for non fused weights
                 pass
+
+            # Only transpose for FP4 weights
+            if is_fp4_weight(new_loaded_weight):
+                new_loaded_weight = new_loaded_weight.transpose(-1, -2)
+
             weight_loader(param,
                           new_loaded_weight,
                           full_param_name,
@@ -447,6 +464,7 @@ class Llama4Model(LlamaModel):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
+
                 if weight_loader == default_weight_loader:
                     weight_loader(param, loaded_weight)
                 else:
@@ -491,11 +509,17 @@ class Llama4Model(LlamaModel):
                             else:
                                 shard_id = "w1"
 
+                            # Transpose if the weights are FP8 or FP4.
+                            if loaded_weight.dtype == torch.uint8 \
+                                or loaded_weight.dtype == torch.float8_e4m3fn:
+                                loaded_weight = loaded_weight.transpose(-1, -2)
+
                             weight_loader(param,
                                           loaded_weight,
                                           name,
                                           shard_id=shard_id,
                                           expert_id=0)
+
                         else:
                             # Regular weight loader (handles both
                             # param.weight_loader and default_weight_loader)
@@ -560,23 +584,32 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         loaded_weight: torch.Tensor,
     ) -> tuple[str, torch.Tensor]:
 
+        # Helper function to permute the weight's channels
         def permute(w: torch.Tensor, n_heads: int):
             attn_in = self.config.head_dim * n_heads
             attn_out = self.config.hidden_size
+
+            # If the weight is FP4 packed as uint8, we need to divide attn_out
+            # by 2.
+            if w.dtype == torch.uint8 and w.shape[1] * 2 == attn_out:
+                attn_out = attn_out // 2
 
             return w.view(n_heads, attn_in // n_heads // 2, 2,
                           attn_out).transpose(1, 2).reshape(attn_in, attn_out)
 
         modules = name.split(".")
 
-        # rotary embeds should be sliced
-        if ("wk" in modules or "k_proj" in modules) \
-           and modules[-1] == "weight":
-            loaded_weight = permute(loaded_weight,
-                                    self.config.num_key_value_heads)
-        elif ("wq" in modules or "q_proj" in modules) \
-                and modules[-1] == "weight":
-            loaded_weight = permute(loaded_weight,
-                                    self.config.num_attention_heads)
+        # Permute Q/K weights and weight block scales for rotary embedding
+        is_weight = modules[-1] == "weight"
+        is_nvfp4_weight_scale = (modules[-1] == "weight_scale" and
+                                 loaded_weight.dtype == torch.float8_e4m3fn)
+
+        if is_weight or is_nvfp4_weight_scale:
+            if ("wk" in modules or "k_proj" in modules):
+                loaded_weight = permute(loaded_weight,
+                                        self.config.num_key_value_heads)
+            elif ("wq" in modules or "q_proj" in modules):
+                loaded_weight = permute(loaded_weight,
+                                        self.config.num_attention_heads)
 
         return name, loaded_weight
