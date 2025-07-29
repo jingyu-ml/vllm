@@ -585,7 +585,7 @@ class Llama4ForCausalLM(LlamaForCausalLM):
     ) -> tuple[str, torch.Tensor]:
 
         # Helper function to permute the weight's channels
-        def permute(w: torch.Tensor, n_heads: int):
+        def permute(w: torch.Tensor, n_heads: int, is_weight_scale: bool):
             attn_in = self.config.head_dim * n_heads
             attn_out = self.config.hidden_size
 
@@ -593,6 +593,11 @@ class Llama4ForCausalLM(LlamaForCausalLM):
             # by 2.
             if w.dtype == torch.uint8 and w.shape[1] * 2 == attn_out:
                 attn_out = attn_out // 2
+
+            # If the weight is a weight scale, we need to divide attn_out by
+            # block size, which is currently 16.
+            elif w.dtype == torch.float8_e4m3fn and is_weight_scale:
+                attn_out = attn_out // 16
 
             return w.view(n_heads, attn_in // n_heads // 2, 2,
                           attn_out).transpose(1, 2).reshape(attn_in, attn_out)
@@ -607,9 +612,11 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         if is_weight or is_nvfp4_weight_scale:
             if ("wk" in modules or "k_proj" in modules):
                 loaded_weight = permute(loaded_weight,
-                                        self.config.num_key_value_heads)
+                                        self.config.num_key_value_heads,
+                                        is_nvfp4_weight_scale)
             elif ("wq" in modules or "q_proj" in modules):
                 loaded_weight = permute(loaded_weight,
-                                        self.config.num_attention_heads)
+                                        self.config.num_attention_heads,
+                                        is_nvfp4_weight_scale)
 
         return name, loaded_weight
