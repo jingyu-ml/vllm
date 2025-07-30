@@ -366,19 +366,29 @@ class Llama4Model(LlamaModel):
 
             # Helper function to check if the weight is FP4.
             # We use uint8 to store FP4 weights for now.
-            def is_fp4_weight(weight):
+            def is_fp4_weight(weight: torch.Tensor) -> bool:
                 return weight.dtype == torch.uint8
-
+            
+            def maybe_transpose_for_loader(weight: torch.Tensor | tuple, fused: bool) -> torch.Tensor | tuple:
+                def _needs_t(t: torch.Tensor) -> bool:
+                    return fused or is_fp4_weight(t)
+                if isinstance(weight, torch.Tensor):
+                    return weight.transpose(-1, -2) if _needs_t(weight) else weight
+                if not weight:
+                    return weight
+                first_is_fp4 = is_fp4_weight(weight[0])
+                if any(is_fp4_weight(w) != first_is_fp4 for w in weight):
+                    raise ValueError(
+                        "All tensors in the weight tuple must share the same FP4 status."
+                    )
+                if _needs_t(weight[0]):
+                    return tuple(w.transpose(-1, -2) for w in weight)
+                return weight
+            new_loaded_weight = maybe_transpose_for_loader(new_loaded_weight, fused=fused)
             if fused:
                 if "w13" in full_param_name:
                     shard_idx = 0 if shard_id == "w1" else 1
                     new_loaded_weight = new_loaded_weight[shard_idx]
-
-                # Only transpose for non-FP4 weights
-                # FP4 weights are already in the correct format and
-                # shouldn't be transposed here.
-                if not is_fp4_weight(new_loaded_weight):
-                    new_loaded_weight = new_loaded_weight.transpose(-1, -2)
 
                 layer_idx = extract_layer_index(name)
                 # EP mapping
@@ -394,10 +404,6 @@ class Llama4Model(LlamaModel):
             else:
                 # TODO: add EP support for non fused weights
                 pass
-
-            # Only transpose for FP4 weights
-            if is_fp4_weight(new_loaded_weight):
-                new_loaded_weight = new_loaded_weight.transpose(-1, -2)
 
             weight_loader(param,
                           new_loaded_weight,
